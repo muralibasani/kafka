@@ -225,6 +225,11 @@ public class StoreChangelogReader implements ChangelogReader {
     private long lastUpdateOffsetTime;
     private final StandbyUpdateListener standbyUpdateListener;
 
+    // cap on per-partition restore buffer size; when a partition's bufferedRecords reaches this
+    // size, its changelog partition is paused on the restore consumer until records drain below
+    // the cap. Decouples restore-path memory from changelog size, preventing OOM during backfills.
+    private final int maxBufferedRecordsPerPartition;
+
     public StoreChangelogReader(final Time time,
                                 final StreamsConfig config,
                                 final LogContext logContext,
@@ -245,6 +250,7 @@ public class StoreChangelogReader implements ChangelogReader {
         this.updateOffsetIntervalMs = config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG) == Long.MAX_VALUE ?
             DEFAULT_OFFSET_UPDATE_MS : config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG);
         this.lastUpdateOffsetTime = 0L;
+        this.maxBufferedRecordsPerPartition = config.getInt(StreamsConfig.RESTORE_BUFFERED_RECORDS_PER_PARTITION_CONFIG);
 
         this.changelogs = new HashMap<>();
     }
@@ -536,23 +542,28 @@ public class StoreChangelogReader implements ChangelogReader {
     }
 
     private boolean shouldResume(final Map<TaskId, Task> tasks, final TopicPartition partition, final TaskType taskType) {
-        final ProcessorStateManager manager = changelogs.get(partition).stateManager;
-        final TaskId taskId = manager.taskId();
-        final Task task = tasks.get(taskId);
-        if (manager.taskType() == taskType) {
-            return task != null;
+        final ChangelogMetadata metadata = changelogs.get(partition);
+        final ProcessorStateManager manager = metadata.stateManager;
+        if (manager.taskType() != taskType) {
+            return false;
         }
-        return false;
+        final Task task = tasks.get(manager.taskId());
+        if (task == null) {
+            return false;
+        }
+        // only resume once the partition's buffer has drained below the cap
+        return metadata.bufferedRecords.size() < maxBufferedRecordsPerPartition;
     }
 
     private boolean shouldPause(final Map<TaskId, Task> tasks, final TopicPartition partition, final TaskType taskType) {
-        final ProcessorStateManager manager = changelogs.get(partition).stateManager;
-        final TaskId taskId = manager.taskId();
-        final Task task = tasks.get(taskId);
-        if (manager.taskType() == taskType) {
-            return task == null;
+        final ChangelogMetadata metadata = changelogs.get(partition);
+        final ProcessorStateManager manager = metadata.stateManager;
+        if (manager.taskType() != taskType) {
+            return false;
         }
-        return false;
+        final Task task = tasks.get(manager.taskId());
+        // pause when the task is unassigned, or when the buffer cap has been hit
+        return task == null || metadata.bufferedRecords.size() >= maxBufferedRecordsPerPartition;
     }
 
     private void maybeLogRestorationProgress() {

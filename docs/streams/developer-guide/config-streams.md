@@ -398,6 +398,23 @@ The maximum number of records to buffer per partition.
 <tr>  
 <td>
 
+restore.buffered.records.per.partition
+</td>  
+<td>
+
+Medium
+</td>  
+<td>
+
+Maximum number of records to buffer per partition during state-store restoration. Bounds the memory used by the restore consumer's per-partition buffer in `StoreChangelogReader`. Distinct from the deprecated `buffered.records.per.partition`, which bounds the main processing queue and does not affect the restore path.
+</td>  
+<td>
+
+`10000`
+</td> </tr>  
+<tr>  
+<td>
+
 statestore.cache.max.bytes
 </td>  
 <td>

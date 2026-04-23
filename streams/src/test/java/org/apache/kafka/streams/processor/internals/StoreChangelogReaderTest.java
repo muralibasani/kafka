@@ -1445,4 +1445,90 @@ public class StoreChangelogReaderTest {
         adminClient.updateEndOffsets(Collections.singletonMap(topicPartition, Math.max(0, messages) + 1));
         consumer.assign(Collections.singletonList(topicPartition));
     }
+
+    @Test
+    public void shouldRejectInvalidRestoreBufferedRecordsPerPartition() {
+        final Properties props = StreamsTestUtils.getStreamsConfig("test-reader");
+        props.put(StreamsConfig.RESTORE_BUFFERED_RECORDS_PER_PARTITION_CONFIG, 0);
+        assertThrows(org.apache.kafka.common.config.ConfigException.class, () -> new StreamsConfig(props));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Task.TaskType.class, names = {"ACTIVE", "STANDBY"})
+    public void shouldPausePartitionWhenRestoreBufferCapIsReached(final Task.TaskType type) {
+        setupStateManagerMock(type);
+        setupStoreMetadata();
+        setupStore();
+        final TaskId taskId = new TaskId(0, 0);
+
+        when(storeMetadata.offset()).thenReturn(5L);
+        if (type == STANDBY) {
+            when(storeMetadata.endOffset()).thenReturn(100L);
+        }
+        when(stateManager.taskId()).thenReturn(taskId);
+
+        // end offset well beyond the cap so the partition is not yet "completed"
+        adminClient.updateEndOffsets(Collections.singletonMap(tp, 1000L));
+
+        final Properties props = StreamsTestUtils.getStreamsConfig("test-reader");
+        props.put(StreamsConfig.RESTORE_BUFFERED_RECORDS_PER_PARTITION_CONFIG, 3);
+        final StreamsConfig cappedConfig = new StreamsConfig(props);
+
+        final StoreChangelogReader reader =
+            new StoreChangelogReader(time, cappedConfig, logContext, adminClient, consumer, callback, standbyListener);
+        reader.register(tp, stateManager);
+
+        if (type == STANDBY) {
+            reader.transitToUpdateStandby();
+        }
+
+        // feed more records than the cap; once bufferedRecords.size() >= 3 the partition should be paused
+        for (long offset = 6L; offset <= 20L; offset++) {
+            consumer.addRecord(new ConsumerRecord<>(topicName, 0, offset, "key".getBytes(), "value".getBytes()));
+        }
+
+        reader.restore(Collections.singletonMap(taskId, mock(Task.class)));
+
+        assertTrue(reader.changelogMetadata(tp).bufferedRecords().size() >= 3,
+            "expected buffer to have filled to at least the cap before pause took effect");
+        assertEquals(Collections.singleton(tp), consumer.paused(),
+            "expected changelog partition to be paused once the buffer cap was reached");
+    }
+
+    @Test
+    public void shouldResumePartitionOnceBufferDrainsBelowCap() {
+        setupActiveStateManager();
+        setupStoreMetadata();
+        setupStore();
+        final TaskId taskId = new TaskId(0, 0);
+
+        // small end offset so restoreChangelog drains the buffer quickly on the next tick
+        when(storeMetadata.offset()).thenReturn(null).thenReturn(9L);
+        when(activeStateManager.taskId()).thenReturn(taskId);
+
+        consumer.updateBeginningOffsets(Collections.singletonMap(tp, 5L));
+        adminClient.updateEndOffsets(Collections.singletonMap(tp, 11L));
+
+        final Properties props = StreamsTestUtils.getStreamsConfig("test-reader");
+        props.put(StreamsConfig.RESTORE_BUFFERED_RECORDS_PER_PARTITION_CONFIG, 3);
+        final StreamsConfig cappedConfig = new StreamsConfig(props);
+
+        final StoreChangelogReader reader =
+            new StoreChangelogReader(time, cappedConfig, logContext, adminClient, consumer, callback, standbyListener);
+        reader.register(tp, activeStateManager);
+
+        consumer.addRecord(new ConsumerRecord<>(topicName, 0, 6L, "key".getBytes(), "value".getBytes()));
+        consumer.addRecord(new ConsumerRecord<>(topicName, 0, 7L, "key".getBytes(), "value".getBytes()));
+        consumer.addRecord(new ConsumerRecord<>(topicName, 0, 8L, "key".getBytes(), "value".getBytes()));
+        consumer.addRecord(new ConsumerRecord<>(topicName, 0, 9L, "key".getBytes(), "value".getBytes()));
+
+        // first tick: restore drains buffered records into the state store
+        reader.restore(Collections.singletonMap(taskId, mock(Task.class)));
+
+        // after restoreChangelog applied records, the buffer is empty and the partition
+        // should be resumed (paused set only contains partitions hitting the cap)
+        assertEquals(0, reader.changelogMetadata(tp).bufferedRecords().size());
+        assertEquals(Collections.emptySet(), consumer.paused(),
+            "expected partition to be resumed once buffered records drained below the cap");
+    }
 }
